@@ -3,6 +3,8 @@ $Script:ModulePath = $PSScriptRoot
 
 $Script:ModuleItem = Get-Item -Path $PSCommandPath
 
+Add-Type -Assembly System.Drawing
+
 #region Origin:\\PSAwtrix3\0.0.0\ps1\_Alias\$AwtrixAlias.ps1
 
 $Script:AwtrixAlias = $null
@@ -2647,7 +2649,9 @@ function Find-Awtrix
     param(
         [Parameter()][uint32]$Count         = 1,
         [Parameter()][uint32]$PollIntervall = 500,
-        [Parameter()][uint32]$Timeout       = 5
+        [Parameter()][uint32]$Timeout       = 5,
+
+        [Parameter(ValueFromPipelineByPropertyName)][string]$Network
     )
 
     $DiscoverMessage = "FIND_AWTRIX"
@@ -2655,50 +2659,63 @@ function Find-Awtrix
     $ReceivePort   = 4211
     $BroadcastPort = 4210
 
-    $WLANIPAddress = (Get-NetIPAddress -InterfaceAlias WLAN, Wifi -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
-
-    $WLANBroadcast = "$($WLANIPAddress.Split('.')[0..2] -join '.').255"
-
-    $socket = [System.Net.Sockets.Socket]::new([System.Net.Sockets.AddressFamily]::InterNetwork, [System.Net.Sockets.SocketType]::Dgram, [System.Net.Sockets.ProtocolType]::Udp)
-
-    $socket.EnableBroadcast = $true # $socket.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket,[System.Net.Sockets.SocketOptionName]::Broadcast, 1)
-
-    $socket.ReceiveTimeout = 1000
-
-    $socket.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($WLANIPAddress), $ReceivePort))
-
-    $result = [ordered]@{}
-
-    $PollTime = 0
-
-    $Timeout *= 1000
-
-    do
+    if($Network)
     {
-        [void]($socket.SendTo([System.Text.Encoding]::ASCII.GetBytes($DiscoverMessage), [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($WLANBroadcast), $BroadcastPort)))
-
-        Start-Sleep -Milliseconds $PollIntervall
-
-        $PollTime += $PollIntervall
-
-        while($socket.Available)
-        {
-            $receiveBuffer = [byte[]]::new(4096)
-
-            $fromEndpoint  = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any,0)
-
-            $received = $socket.ReceiveFrom($receiveBuffer, [ref]$fromEndpoint);
-
-            $Name = [System.Text.Encoding]::ASCII.GetString($receiveBuffer[0..$received])
-
-            $result[$Name] = "$($fromEndpoint.Address)"
-        }
+        $IPAddress, $PrefixLength, $Rest = "$($Network)/24".Split("/")
     }
-    until(($result.Count -eq $Count) -or ($PollTime -ge $Timeout))
+    else
+    {
+        $Network = Get-NetIPAddress -AddressFamily IPv4 | Select-Object -First 1
 
-    $socket.Close()
+        $IPAddress    = $Network.IPAddress
+        $PrefixLength = $Network.PrefixLength
+    }
 
-    $result
+    if($IPAddress)
+    {
+        $Broadcast = @(@($IPAddress.Split('.')[0..(($PrefixLength/8)-1)]) + @("255", "255", "255", "255"))[0..3] -join '.'
+
+        $socket = [System.Net.Sockets.Socket]::new([System.Net.Sockets.AddressFamily]::InterNetwork, [System.Net.Sockets.SocketType]::Dgram, [System.Net.Sockets.ProtocolType]::Udp)
+
+        $socket.EnableBroadcast = $true # $socket.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket,[System.Net.Sockets.SocketOptionName]::Broadcast, 1)
+
+        $socket.ReceiveTimeout = 1000
+
+        $socket.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($IPAddress), $ReceivePort))
+
+        $result = [ordered]@{}
+
+        $PollTime = 0
+
+        $Timeout *= 1000
+
+        do
+        {
+            [void]($socket.SendTo([System.Text.Encoding]::ASCII.GetBytes($DiscoverMessage), [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($Broadcast), $BroadcastPort)))
+
+            Start-Sleep -Milliseconds $PollIntervall
+
+            $PollTime += $PollIntervall
+
+            while($socket.Available)
+            {
+                $receiveBuffer = [byte[]]::new(4096)
+
+                $fromEndpoint  = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any,0)
+
+                $received = $socket.ReceiveFrom($receiveBuffer, [ref]$fromEndpoint);
+
+                $Name = [System.Text.Encoding]::ASCII.GetString($receiveBuffer[0..$received])
+
+                $result[$Name] = "$($fromEndpoint.Address)"
+            }
+        }
+        until(($result.Count -eq $Count) -or ($PollTime -ge $Timeout))
+
+        $socket.Close()
+
+        $result
+    }
 }
 
 # discover Awtrix via arp
@@ -2713,6 +2730,45 @@ function Find-Awtrix
 }
 
 #endregion Origin:\\PSAwtrix3\0.0.0\ps1\Find-Awtrix.ps1
+
+#region Origin:\\PSAwtrix3\0.0.0\ps1\Get-AwtrixNetwork.ps1
+
+function Get-AwtrixNetwork
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipelineByPropertyName,ValueFromPipeline)][string]$Name
+    )
+
+    $Property1 = @(
+
+        @{ Name = "Medium"      ; Expression = { switch($_.NetAdapter.NdisPhysicalMedium) { 9 { 'Wifi' } 14 { 'Ethernet' } } } }
+        @{ Name = "Interface"   ; Expression = {  $_.InterfaceAlias  } }
+        @{ Name = "SSID"        ; Expression = {  $_.NetProfile.Name } }
+        @{ Name = "IPAddress"   ; Expression = { ($_.IPv4Address | Select-Object -First 1).IPAddress    } }
+        @{ Name = "PrefixLength"; Expression = { ($_.IPv4Address | Select-Object -First 1).PrefixLength } }
+        @{ Name = "Device"      ; Expression = {  $_.InterfaceDescription } }
+    )
+
+    $Property2 = @(
+
+        "Medium"
+        "Interface"    
+        "SSID"      
+        "IPAddress"    
+        "PrefixLength" 
+        "Device"       
+
+        @{ Name = "Name"   ; Expression = { "$($_.Medium)\$($_.Interface)\$($_.SSID)" } }
+        @{ Name = "Network"; Expression = { "$($_.IPAddress)/$($_.PrefixLength)"      } }
+    )
+
+    $Filter = (@($Name, ".*") -ne $null) | Select-Object -First 1
+
+    Get-NetIPConfiguration -Detailed | Where-Object { ($_.NetAdapter.Status -eq 'Up') -and ($_.NetAdapter.NdisPhysicalMedium -in (9,14)) } | Select-Object -Property $Property1 | Select-Object -Property $Property2 | Where-Object -Property Name -Match -Value $Filter
+}
+
+#endregion Origin:\\PSAwtrix3\0.0.0\ps1\Get-AwtrixNetwork.ps1
 
 #region Origin:\\PSAwtrix3\0.0.0\ps1\Restart-Awtrix.ps1
 
@@ -3287,6 +3343,8 @@ $Export = @{
     Function = @"
     
             Get-AwtrixModulePath
+
+            Get-AwtrixNetwork
 
            Find-Awtrix
 
